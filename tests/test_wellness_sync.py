@@ -150,6 +150,11 @@ class _FakeConnection(WellnessGatewayConnection):
                 "remSleepSeconds": 6_000,
                 "awakeSleepSeconds": 1_000,
                 "sleepScores": {"overall": {"value": 88}},
+                "sleepStartTimestampLocal": _local_epoch_ms(
+                    requested_date - timedelta(days=1), 22, 4
+                ),
+                "sleepEndTimestampLocal": _local_epoch_ms(requested_date, 6, 30),
+                "sleepStartTimestampGMT": "must-not-survive",
             }
         }
 
@@ -270,6 +275,11 @@ def _body_timestamp(day: date) -> int:
     return int(datetime(day.year, day.month, day.day, 12, tzinfo=UTC).timestamp() * 1_000)
 
 
+def _local_epoch_ms(day: date, hour: int, minute: int) -> int:
+    instant = datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
+    return int(instant.timestamp() * 1_000)
+
+
 def _source(result: Any, source: WellnessSource) -> Any:
     return next(item for item in result.sources if item.source is source)
 
@@ -341,6 +351,8 @@ def test_initial_refresh_uses_exact_bounded_full_plan_and_precedence(tmp_path: P
     assert today.step_goal == 10_000
     assert today.resting_heart_rate_bpm == 55
     assert today.sleep_score == 88
+    assert today.sleep_start_local == "2026-08-25T22:04:00"
+    assert today.sleep_end_local == "2026-08-26T06:30:00"
     assert today.hrv_weekly_average_ms == 46
     assert today.body_battery_latest == 60
     assert today.training_readiness_score == 74
@@ -381,13 +393,12 @@ def test_current_cadence_and_backfill_cooldown_are_independent(tmp_path: Path) -
     configured.clock.now += timedelta(minutes=30)
     backfill_result = configured.service.refresh()
 
-    assert backfill_result.request_attempts == 7
+    assert backfill_result.request_attempts == 12
     names = [call[0] for call in configured.gateway.connections[-1].calls]
     assert names == [
         "user_summary",
         "body_battery",
-        "sleep_detail",
-        "sleep_detail",
+        *["sleep_detail"] * 7,
         "training_readiness",
         "training_readiness",
     ]
@@ -400,13 +411,46 @@ def test_manual_refresh_bypasses_only_current_value_cadence(tmp_path: Path) -> N
     result = configured.service.refresh(manual=True)
 
     assert result.full_reconciliation is False
-    assert result.request_attempts == 5
+    assert result.request_attempts == 11
     assert [call[0] for call in configured.gateway.connections[-1].calls] == [
         "user_summary",
         "body_battery",
-        "sleep_detail",
+        *["sleep_detail"] * 7,
         "training_readiness",
     ]
+
+
+def test_manual_refresh_backfills_missing_sleep_clocks_without_dropping_rows(
+    tmp_path: Path,
+) -> None:
+    configured = _Configured(tmp_path)
+    configured.service.refresh()
+    with closing(sqlite3.connect(configured.paths.activity_database)) as connection:
+        connection.execute(
+            "UPDATE wellness_daily SET sleep_start_local = NULL, sleep_end_local = NULL"
+        )
+        connection.commit()
+
+    configured.service.refresh(manual=True)
+
+    stored = {
+        day.calendar_date: day
+        for day in configured.repository.wellness_between(TODAY - timedelta(days=29), TODAY)
+    }
+    for offset in range(7):
+        day = TODAY - timedelta(days=offset)
+        row = stored[day]
+        assert row.sleep_start_local == f"{(day - timedelta(days=1)).isoformat()}T22:04:00"
+        assert row.sleep_end_local == f"{day.isoformat()}T06:30:00"
+        assert row.sleep_score == 88
+        assert row.sleep_total_seconds == 27_000
+    today = stored[TODAY]
+    assert today.steps == 9_999
+    older = stored[TODAY - timedelta(days=8)]
+    assert older.steps == 111
+    assert older.sleep_score == 77
+    assert older.sleep_start_local is None
+    assert older.sleep_end_local is None
 
 
 def test_historical_overlap_runs_once_each_local_date_and_full_no_more_than_weekly(

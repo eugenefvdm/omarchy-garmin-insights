@@ -102,6 +102,8 @@ class SleepDay:
     light_seconds: int | None
     rem_seconds: int | None
     awake_seconds: int | None
+    start_local: str | None = None
+    end_local: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +161,8 @@ class DailyWellness:
     hrv_balanced_low_ms: float | None = None
     hrv_balanced_upper_ms: float | None = None
     resting_heart_rate_bpm: int | None = None
+    sleep_start_local: str | None = None
+    sleep_end_local: str | None = None
 
 
 WellnessWriteDay = (

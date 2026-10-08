@@ -361,7 +361,12 @@ def test_empty_sleep_range_is_missing() -> None:
     assert parse_sleep_range(None, START, END) == ()
 
 
-def test_sleep_detail_admits_reviewed_score_and_stage_values_only() -> None:
+def _local_epoch_ms(day: date, hour: int, minute: int) -> int:
+    instant = datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
+    return int(instant.timestamp() * 1_000)
+
+
+def test_sleep_detail_admits_reviewed_score_stage_and_local_clock_values_only() -> None:
     payload = {
         "dailySleepDTO": {
             "calendarDate": DAY.isoformat(),
@@ -371,7 +376,9 @@ def test_sleep_detail_admits_reviewed_score_and_stage_values_only() -> None:
             "remSleepSeconds": 6_000,
             "awakeSleepSeconds": 2_400,
             "sleepScores": {"overall": {"value": 91, "qualifierKey": "discard"}},
-            "sleepStartTimestampLocal": "must-not-survive",
+            "sleepStartTimestampLocal": _local_epoch_ms(DAY - timedelta(days=1), 22, 4),
+            "sleepEndTimestampLocal": _local_epoch_ms(DAY, 6, 30),
+            "sleepStartTimestampGMT": "must-not-survive",
             "heartRateSamples": ["must-not-survive"],
         },
         "wellnessSpO2SleepSummaryDTO": {"private": "must-not-survive"},
@@ -384,8 +391,28 @@ def test_sleep_detail_admits_reviewed_score_and_stage_values_only() -> None:
     assert result.total_seconds == 28_800
     assert (result.deep_seconds, result.light_seconds, result.rem_seconds) == (5_400, 15_000, 6_000)
     assert result.awake_seconds == 2_400
-    assert not hasattr(result, "sleep_start_timestamp_local")
+    assert result.calendar_date == DAY
+    assert result.start_local == "2026-08-24T22:04:00"
+    assert result.end_local == "2026-08-25T06:30:00"
     assert "must-not-survive" not in repr(result)
+
+
+def test_sleep_detail_leaves_missing_timestamps_null() -> None:
+    result = parse_sleep_detail(
+        {
+            "dailySleepDTO": {
+                "calendarDate": DAY.isoformat(),
+                "sleepTimeSeconds": 28_800,
+                "sleepStartTimestampLocal": None,
+            }
+        },
+        DAY,
+    )
+
+    assert result is not None
+    assert result.calendar_date == DAY
+    assert result.start_local is None
+    assert result.end_local is None
 
 
 @pytest.mark.parametrize(
@@ -410,6 +437,8 @@ def test_sparse_sleep_detail_preserves_missing_values(sleep_scores: object) -> N
     assert result.score is None
     assert result.total_seconds is None
     assert result.deep_seconds is None
+    assert result.start_local is None
+    assert result.end_local is None
 
 
 @pytest.mark.parametrize(
@@ -463,6 +492,43 @@ def test_sparse_sleep_detail_preserves_missing_values(sleep_scores: object) -> N
             id="stage-sum-high",
         ),
         pytest.param({"dailySleepDTO": {"calendarDate": "2026-08-24"}}, id="wrong-date"),
+        pytest.param(
+            {
+                "dailySleepDTO": {
+                    "calendarDate": DAY.isoformat(),
+                    "sleepStartTimestampLocal": "2026-08-25T22:04:00",
+                }
+            },
+            id="timestamp-string",
+        ),
+        pytest.param(
+            {
+                "dailySleepDTO": {
+                    "calendarDate": DAY.isoformat(),
+                    "sleepStartTimestampLocal": True,
+                }
+            },
+            id="timestamp-boolean",
+        ),
+        pytest.param(
+            {
+                "dailySleepDTO": {
+                    "calendarDate": DAY.isoformat(),
+                    "sleepEndTimestampLocal": _local_epoch_ms(DAY - timedelta(days=2), 22, 0),
+                }
+            },
+            id="timestamp-outside-night",
+        ),
+        pytest.param(
+            {
+                "dailySleepDTO": {
+                    "calendarDate": DAY.isoformat(),
+                    "sleepStartTimestampLocal": _local_epoch_ms(DAY, 8, 0),
+                    "sleepEndTimestampLocal": _local_epoch_ms(DAY, 6, 0),
+                }
+            },
+            id="end-before-start",
+        ),
     ],
 )
 def test_malformed_sleep_detail_is_rejected(payload: object) -> None:

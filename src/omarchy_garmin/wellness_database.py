@@ -106,8 +106,10 @@ INSERT INTO wellness_daily (
     hrv_status,
     hrv_balanced_low_ms,
     hrv_balanced_upper_ms,
-    resting_heart_rate_bpm
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    resting_heart_rate_bpm,
+    sleep_start_local,
+    sleep_end_local
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_fingerprint, calendar_date) DO UPDATE SET
     steps = coalesce(excluded.steps, wellness_daily.steps),
     step_goal = coalesce(excluded.step_goal, wellness_daily.step_goal),
@@ -161,7 +163,9 @@ ON CONFLICT(account_fingerprint, calendar_date) DO UPDATE SET
     ),
     resting_heart_rate_bpm = coalesce(
         excluded.resting_heart_rate_bpm, wellness_daily.resting_heart_rate_bpm
-    )
+    ),
+    sleep_start_local = coalesce(excluded.sleep_start_local, wellness_daily.sleep_start_local),
+    sleep_end_local = coalesce(excluded.sleep_end_local, wellness_daily.sleep_end_local)
 """
 
 
@@ -203,6 +207,22 @@ def _optional_real(value: object) -> float | None:
     if not math.isfinite(result) or not 0 <= result <= 1_000:
         raise ValueError("wellness number is invalid")
     return result
+
+
+def _optional_local_clock(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not 19 <= len(value) <= 40:
+        raise ValueError("wellness local timestamp is invalid")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ValueError("wellness local timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("wellness local timestamp is invalid") from error
+    if parsed.tzinfo is not None or parsed.isoformat(timespec="seconds") != value:
+        raise ValueError("wellness local timestamp is invalid")
+    return value
 
 
 def _optional_text(value: object) -> str | None:
@@ -274,6 +294,8 @@ def _daily_for_source(source: WellnessSource, day: WellnessWriteDay) -> DailyWel
             sleep_light_seconds=sleep_parts[1],
             sleep_rem_seconds=sleep_parts[2],
             sleep_awake_seconds=sleep_parts[3],
+            sleep_start_local=_optional_local_clock(day.start_local),
+            sleep_end_local=_optional_local_clock(day.end_local),
         )
     if source is WellnessSource.HRV and isinstance(day, HrvDay):
         balanced_low = _optional_real(day.balanced_low_ms)
@@ -352,6 +374,8 @@ def _validated_daily(day: DailyWellness) -> DailyWellness:
         resting_heart_rate_bpm=_optional_integer(
             day.resting_heart_rate_bpm, minimum=20, maximum=300
         ),
+        sleep_start_local=_optional_local_clock(day.sleep_start_local),
+        sleep_end_local=_optional_local_clock(day.sleep_end_local),
     )
 
 
@@ -456,7 +480,9 @@ class WellnessRepository:
                     hrv_status,
                     hrv_balanced_low_ms,
                     hrv_balanced_upper_ms,
-                    resting_heart_rate_bpm
+                    resting_heart_rate_bpm,
+                    sleep_start_local,
+                    sleep_end_local
                 FROM wellness_daily
                 WHERE account_fingerprint = ? AND calendar_date BETWEEN ? AND ?
                 ORDER BY calendar_date
@@ -670,7 +696,7 @@ class WellnessRepository:
 
     @staticmethod
     def _read_row(row: Sequence[object]) -> DailyWellness:
-        if len(row) != 22:
+        if len(row) != 24:
             raise ValueError("stored wellness row has an unexpected shape")
         calendar_date = date.fromisoformat(str(row[0]))
         return _validated_daily(DailyWellness(calendar_date, *row[1:]))  # type: ignore[arg-type]

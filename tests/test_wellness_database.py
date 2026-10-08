@@ -102,6 +102,8 @@ def test_schema_one_migration_preserves_activity_rows_and_adds_only_reviewed_wel
     assert activity == ("101", "Fabricated run", "running", "2026-08-25")
     assert "body_battery_latest" in columns
     assert "training_readiness_score" in columns
+    assert "sleep_start_local" in columns
+    assert "sleep_end_local" in columns
     assert "body_battery_values_array" not in columns
     assert "timestamp_local" not in columns
     assert "input_context" not in columns
@@ -608,3 +610,126 @@ def test_invalid_source_day_sets_are_rejected_before_persistence(
         )
 
     assert (tmp_path / "private").exists() is False
+
+
+def test_schema_two_migration_adds_sleep_clocks_and_preserves_retained_scalars(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private" / "activities.sqlite3"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript(database_module._MIGRATION_1)
+        connection.executescript(database_module._MIGRATION_2)
+        connection.execute("PRAGMA user_version = 2")
+        connection.execute(
+            "INSERT INTO wellness_account_scope (singleton_id, account_fingerprint) VALUES (1, ?)",
+            (ACCOUNT_A,),
+        )
+        connection.execute(
+            """
+            INSERT INTO wellness_daily (
+                account_fingerprint, calendar_date, steps, sleep_total_seconds
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (ACCOUNT_A, TODAY.isoformat(), 4_200, 27_000),
+        )
+        connection.commit()
+
+    repository = WellnessRepository(database, ACCOUNT_A)
+    stored = repository.wellness_between(TODAY, TODAY)[0]
+
+    with closing(sqlite3.connect(database)) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(wellness_daily)")]
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE name = 'wellness_daily'"
+        ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                UPDATE wellness_daily
+                SET sleep_start_local = '2026-08-26T22:04'
+                WHERE calendar_date = ?
+                """,
+                (TODAY.isoformat(),),
+            )
+    assert version == SCHEMA_VERSION
+    assert columns[-2:] == ["sleep_start_local", "sleep_end_local"]
+    assert table_sql is not None
+    assert "STRICT" in str(table_sql[0])
+    assert stored.steps == 4_200
+    assert stored.sleep_total_seconds == 27_000
+    assert stored.sleep_start_local is None
+    assert stored.sleep_end_local is None
+
+
+def test_sleep_clock_upsert_fills_times_without_erasing_retained_scalars(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _upsert_steps(repository, TODAY, 8_765)
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [SleepDay(TODAY, 82, 27_000, 4_000, 16_000, 6_000, 1_000)],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [
+            SleepDay(
+                TODAY,
+                82,
+                27_000,
+                4_000,
+                16_000,
+                6_000,
+                1_000,
+                "2026-08-25T22:04:00",
+                "2026-08-26T06:30:00",
+            )
+        ],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [SleepDay(TODAY, None, None, None, None, None, None)],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+
+    stored = repository.wellness_between(TODAY, TODAY)
+    assert len(stored) == 1
+    assert stored[0].steps == 8_765
+    assert stored[0].sleep_total_seconds == 27_000
+    assert stored[0].sleep_score == 82
+    assert stored[0].sleep_start_local == "2026-08-25T22:04:00"
+    assert stored[0].sleep_end_local == "2026-08-26T06:30:00"
+
+
+@pytest.mark.parametrize(
+    "stored_clock",
+    [
+        pytest.param("2026-08-26T22:04:00Z", id="timezone"),
+        pytest.param("2026-13-26T22:04:00", id="impossible-date"),
+        pytest.param("2026-08-26T22:04:0\n", id="control-character"),
+    ],
+)
+def test_malformed_stored_sleep_clock_is_rejected_on_read(
+    tmp_path: Path,
+    stored_clock: str,
+) -> None:
+    repository = _repository(tmp_path)
+    _upsert_steps(repository, TODAY, 1_000)
+    with closing(sqlite3.connect(tmp_path / "private" / "activities.sqlite3")) as connection:
+        connection.execute(
+            """
+            UPDATE wellness_daily
+            SET sleep_start_local = ?
+            WHERE calendar_date = ?
+            """,
+            (stored_clock, TODAY.isoformat()),
+        )
+        connection.commit()
+
+    with pytest.raises(WellnessDatabaseError):
+        repository.wellness_between(TODAY, TODAY)
