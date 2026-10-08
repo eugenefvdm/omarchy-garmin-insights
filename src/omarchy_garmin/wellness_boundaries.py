@@ -308,8 +308,24 @@ def _sleep_score(row: Mapping[object, object], source: WellnessSource) -> int | 
     return _optional_integer(overall.get("value"), source, minimum=0, maximum=_MAX_SCORE)
 
 
+def _local_epoch_clock(value: object, source: WellnessSource, calendar_date: date) -> str | None:
+    """Map Garmin's local-wall-time epoch milliseconds to a naive ISO-8601 timestamp."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _invalid(source)
+    earliest = datetime.combine(calendar_date - timedelta(days=1), time.min, tzinfo=UTC)
+    latest = datetime.combine(calendar_date + timedelta(days=1), time.min, tzinfo=UTC)
+    minimum = int(earliest.timestamp() * 1_000)
+    maximum = int(latest.timestamp() * 1_000)
+    if value < minimum or value >= maximum:
+        raise _invalid(source)
+    parsed = datetime.fromtimestamp(value / 1_000, tz=UTC).replace(tzinfo=None)
+    return parsed.isoformat(timespec="seconds")
+
+
 def parse_sleep_detail(payload: object, requested_date: date) -> SleepDay | None:
-    """Validate one detailed Sleep response and discard samples and timestamps."""
+    """Validate one detailed Sleep response and discard samples and unreviewed fields."""
     source = WellnessSource.SLEEP
     if payload is None:
         return None
@@ -339,7 +355,21 @@ def parse_sleep_detail(payload: object, requested_date: date) -> SleepDay | None
     calendar_date = _calendar_date(row.get("calendarDate"), source, requested_date, requested_date)
     if calendar_date is None:
         return None
-    return SleepDay(calendar_date, score, total, deep, light, rem, awake)
+    start_local = _local_epoch_clock(row.get("sleepStartTimestampLocal"), source, calendar_date)
+    end_local = _local_epoch_clock(row.get("sleepEndTimestampLocal"), source, calendar_date)
+    if start_local is not None and end_local is not None and start_local > end_local:
+        raise _invalid(source)
+    return SleepDay(
+        calendar_date,
+        score,
+        total,
+        deep,
+        light,
+        rem,
+        awake,
+        start_local,
+        end_local,
+    )
 
 
 def _hrv_day(

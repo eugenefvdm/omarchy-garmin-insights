@@ -22,7 +22,7 @@ from omarchy_garmin.storage import (
     private_file_exists,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class GarminDatabaseError(RuntimeError):
@@ -191,7 +191,13 @@ SELECT account_fingerprint, source, refreshed_at FROM wellness_source_state;
 DROP TABLE wellness_source_state;
 ALTER TABLE wellness_source_state_next RENAME TO wellness_source_state;
 """
-_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2, 3: _MIGRATION_3}
+_MIGRATION_4 = """
+ALTER TABLE wellness_daily ADD COLUMN sleep_start_local TEXT
+    CHECK (sleep_start_local IS NULL OR length(sleep_start_local) BETWEEN 19 AND 40);
+ALTER TABLE wellness_daily ADD COLUMN sleep_end_local TEXT
+    CHECK (sleep_end_local IS NULL OR length(sleep_end_local) BETWEEN 19 AND 40);
+"""
+_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2, 3: _MIGRATION_3, 4: _MIGRATION_4}
 
 _SCHEMA_1_COLUMNS = {
     "activities": (
@@ -254,7 +260,20 @@ _SCHEMA_3_COLUMNS = {
         "vo2_max_cycling",
     ),
 }
-_SCHEMA_COLUMNS = {1: _SCHEMA_1_COLUMNS, 2: _SCHEMA_2_COLUMNS, 3: _SCHEMA_3_COLUMNS}
+_SCHEMA_4_COLUMNS = {
+    **_SCHEMA_3_COLUMNS,
+    "wellness_daily": (
+        *_SCHEMA_3_COLUMNS["wellness_daily"],
+        "sleep_start_local",
+        "sleep_end_local",
+    ),
+}
+_SCHEMA_COLUMNS = {
+    1: _SCHEMA_1_COLUMNS,
+    2: _SCHEMA_2_COLUMNS,
+    3: _SCHEMA_3_COLUMNS,
+    4: _SCHEMA_4_COLUMNS,
+}
 
 
 def _required_text(value: object) -> str:

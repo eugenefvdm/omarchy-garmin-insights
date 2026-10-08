@@ -59,6 +59,7 @@ CURRENT_SLOW_INTERVAL = timedelta(hours=4)
 BACKFILL_INTERVAL = timedelta(hours=1)
 SLEEP_BACKFILL_DAYS = 7
 MAX_BACKFILL_DATES_PER_SOURCE = 2
+MAX_SLEEP_DETAIL_CALLS = 7
 MAX_SINGLE_DATE_BACKFILL_CALLS = 4
 MAX_WELLNESS_DATA_CALLS = 18
 
@@ -386,6 +387,48 @@ def _missing_sleep_detail(day: DailyWellness | None) -> bool:
     )
 
 
+def _needs_sleep_clock(day: DailyWellness | None) -> bool:
+    if day is None:
+        return False
+    has_sleep = any(
+        value is not None
+        for value in (
+            day.sleep_score,
+            day.sleep_total_seconds,
+            day.sleep_deep_seconds,
+            day.sleep_light_seconds,
+            day.sleep_rem_seconds,
+            day.sleep_awake_seconds,
+        )
+    )
+    if not has_sleep:
+        return False
+    return day.sleep_start_local is None or day.sleep_end_local is None
+
+
+def _extend_sleep_clock_dates(
+    sleep_dates: tuple[date, ...],
+    *,
+    today: date,
+    stored: Mapping[date, DailyWellness],
+    enabled: bool,
+    base_calls: int,
+) -> tuple[date, ...]:
+    """Add retained dates that already have sleep values but no local clock times."""
+    if not enabled:
+        return sleep_dates
+    selected = list(sleep_dates)
+    oldest = today - timedelta(days=WELLNESS_RETENTION_DAYS - 1)
+    candidate = today
+    while candidate >= oldest and len(selected) < MAX_SLEEP_DETAIL_CALLS:
+        if _needs_sleep_clock(stored.get(candidate)) and candidate not in selected:
+            if base_calls + len(selected) + 1 > MAX_WELLNESS_DATA_CALLS:
+                break
+            selected.append(candidate)
+        candidate -= timedelta(days=1)
+    return tuple(selected)
+
+
 def _missing_training_readiness(day: DailyWellness | None) -> bool:
     return day is None or (
         day.training_readiness_score is None and day.training_readiness_level is None
@@ -484,6 +527,25 @@ def build_refresh_plan(
     )
     if len(sleep_dates) + len(readiness_dates) > MAX_SINGLE_DATE_BACKFILL_CALLS:
         raise WellnessSyncConfigurationError("wellness single-date request plan is excessive")
+    occupied = WellnessRefreshPlan(
+        historical_start=historical_start,
+        full_reconciliation=full,
+        current_steps=current_steps,
+        current_body_battery=current_body_battery,
+        current_sleep=current_sleep,
+        current_training_readiness=current_readiness,
+        backfill=sleep_backfill or readiness_backfill,
+        sleep_dates=sleep_dates,
+        training_readiness_dates=readiness_dates,
+        vo2_max_start=vo2_start,
+    ).data_call_count(today)
+    sleep_dates = _extend_sleep_clock_dates(
+        sleep_dates,
+        today=today,
+        stored=stored,
+        enabled=current_sleep or backfill_due,
+        base_calls=occupied - len(sleep_dates),
+    )
     plan = WellnessRefreshPlan(
         historical_start=historical_start,
         full_reconciliation=full,
