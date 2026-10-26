@@ -7,6 +7,9 @@ import pytest
 
 from omarchy_garmin.wellness import (
     InvalidWellnessDataError,
+    SleepLevel,
+    SleepNap,
+    SleepStage,
     UnsupportedWellnessSourceError,
     WellnessFailureClassification,
     WellnessSource,
@@ -395,6 +398,9 @@ def test_sleep_detail_admits_reviewed_score_stage_and_local_clock_values_only() 
     assert result.calendar_date == DAY
     assert result.start_local == "2026-08-24T22:04:00"
     assert result.end_local == "2026-08-25T06:30:00"
+    assert result.nap_time_seconds is None
+    assert result.levels == ()
+    assert result.naps == ()
     assert "must-not-survive" not in repr(result)
 
 
@@ -414,6 +420,123 @@ def test_sleep_detail_leaves_missing_timestamps_null() -> None:
     assert result.calendar_date == DAY
     assert result.start_local is None
     assert result.end_local is None
+    assert result.levels == ()
+    assert result.naps == ()
+
+
+def _fabricated_sleep_levels() -> list[dict[str, object]]:
+    return [
+        {
+            "startGMT": "2026-08-24T22:00:00.0",
+            "endGMT": "2026-08-24T23:00:00.0",
+            "activityLevel": 0.0,
+        },
+        {
+            "startGMT": "2026-08-24T23:00:00.0",
+            "endGMT": "2026-08-25T03:00:00.0",
+            "activityLevel": 1,
+        },
+        {
+            "startGMT": "2026-08-25T03:00:00.0",
+            "endGMT": "2026-08-25T04:00:00.0",
+            "activityLevel": 2.0,
+        },
+        {
+            "startGMT": "2026-08-25T04:00:00.0",
+            "endGMT": "2026-08-25T04:10:00.0",
+            "activityLevel": 3,
+        },
+    ]
+
+
+def _fabricated_sleep_detail(**dto_overrides: object) -> dict[str, object]:
+    dto: dict[str, object] = {
+        "calendarDate": DAY.isoformat(),
+        "sleepTimeSeconds": 22_200,
+        "deepSleepSeconds": 3_600,
+        "lightSleepSeconds": 14_400,
+        "remSleepSeconds": 3_600,
+        "awakeSleepSeconds": 600,
+        "napTimeSeconds": 0,
+        "sleepScores": {"overall": {"value": 80}},
+        "heartRateSamples": ["discard-me"],
+    }
+    dto.update(dto_overrides)
+    return {
+        "dailySleepDTO": dto,
+        "sleepLevels": _fabricated_sleep_levels(),
+        "sleepHeartRate": ["discard-me"],
+        "sleepMovement": ["discard-me"],
+    }
+
+
+def test_sleep_detail_admits_stage_intervals_and_keeps_other_samples_out() -> None:
+    result = parse_sleep_detail(_fabricated_sleep_detail(), DAY)
+
+    assert result is not None
+    assert result.levels == (
+        SleepLevel(SleepStage.DEEP, "2026-08-24T22:00:00Z", "2026-08-24T23:00:00Z"),
+        SleepLevel(SleepStage.LIGHT, "2026-08-24T23:00:00Z", "2026-08-25T03:00:00Z"),
+        SleepLevel(SleepStage.REM, "2026-08-25T03:00:00Z", "2026-08-25T04:00:00Z"),
+        SleepLevel(SleepStage.AWAKE, "2026-08-25T04:00:00Z", "2026-08-25T04:10:00Z"),
+    )
+    assert result.naps == ()
+    assert result.nap_time_seconds == 0
+    assert "discard-me" not in repr(result)
+
+
+def test_sleep_detail_admits_one_nap_and_local_clocks_from_the_offset() -> None:
+    result = parse_sleep_detail(
+        _fabricated_sleep_detail(
+            napTimeSeconds=1_800,
+            dailyNapDTOS=[
+                {
+                    "calendarDate": DAY.isoformat(),
+                    "napTimeSec": 1_800,
+                    "napStartTimestampGMT": "2026-08-25T09:00:00",
+                    "napEndTimestampGMT": "2026-08-25T09:30:00",
+                    "napStartTimeOffset": 120,
+                    "napEndTimeOffset": 120,
+                    "napFeedback": "discard-me",
+                    "deviceId": "discard-me",
+                    "userProfilePK": 99,
+                }
+            ],
+        ),
+        DAY,
+    )
+
+    assert result is not None
+    assert result.nap_time_seconds == 1_800
+    assert result.naps == (
+        SleepNap(
+            1_800,
+            "2026-08-25T09:00:00Z",
+            "2026-08-25T09:30:00Z",
+            "2026-08-25T11:00:00",
+            "2026-08-25T11:30:00",
+        ),
+    )
+    assert "discard-me" not in repr(result)
+
+
+def test_sleep_level_duration_allows_one_second_of_slack() -> None:
+    result = parse_sleep_detail(_fabricated_sleep_detail(deepSleepSeconds=3_601), DAY)
+
+    assert result is not None
+    assert result.deep_seconds == 3_601
+    assert result.levels is not None
+    assert len(result.levels) == 4
+
+
+def test_sleep_level_duration_mismatch_keeps_scalars_and_drops_only_levels() -> None:
+    result = parse_sleep_detail(_fabricated_sleep_detail(deepSleepSeconds=3_603), DAY)
+
+    assert result is not None
+    assert result.deep_seconds == 3_603
+    assert result.levels is None
+    assert result.naps == ()
+    assert result.nap_time_seconds == 0
 
 
 @pytest.mark.parametrize(
@@ -529,6 +652,270 @@ def test_sparse_sleep_detail_preserves_missing_values(sleep_scores: object) -> N
                 }
             },
             id="end-before-start",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00.0",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": 4,
+                    }
+                ],
+            },
+            id="unknown-activity-level",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T23:00:00.0",
+                        "endGMT": "2026-08-24T22:00:00.0",
+                        "activityLevel": 1,
+                    }
+                ],
+            },
+            id="inverted-level",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00.0",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": 0,
+                    },
+                    {
+                        "startGMT": "2026-08-25T00:00:00.0",
+                        "endGMT": "2026-08-25T01:00:00.0",
+                        "activityLevel": 1,
+                    },
+                ],
+            },
+            id="level-gap",
+        ),
+        pytest.param(
+            {**_fabricated_sleep_detail(), "sleepLevels": [{}] * 201},
+            id="too-many-levels",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00.0",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": True,
+                    }
+                ],
+            },
+            id="boolean-activity-level",
+        ),
+        pytest.param(
+            _fabricated_sleep_detail(
+                napTimeSeconds=1_800,
+                dailyNapDTOS=[
+                    {
+                        "calendarDate": DAY.isoformat(),
+                        "napTimeSec": 1_800,
+                        "napStartTimestampGMT": "2026-08-25T09:30:00",
+                        "napEndTimestampGMT": "2026-08-25T09:00:00",
+                        "napStartTimeOffset": 120,
+                        "napEndTimeOffset": 120,
+                    }
+                ],
+            ),
+            id="inverted-nap",
+        ),
+        pytest.param(
+            _fabricated_sleep_detail(
+                napTimeSeconds=1_800,
+                dailyNapDTOS=[
+                    {
+                        "calendarDate": DAY.isoformat(),
+                        "napTimeSec": 1_800,
+                        "napStartTimestampGMT": "2026-08-25T09:00:00",
+                        "napEndTimestampGMT": "2026-08-25T09:20:00",
+                        "napStartTimeOffset": 120,
+                        "napEndTimeOffset": 120,
+                    }
+                ],
+            ),
+            id="nap-duration-disagrees",
+        ),
+        pytest.param(
+            _fabricated_sleep_detail(
+                napTimeSeconds=1_800,
+                dailyNapDTOS=[{}] * 9,
+            ),
+            id="too-many-naps",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00Z",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": 0,
+                    }
+                ],
+            },
+            id="level-timezone-suffix",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00.5",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": 0,
+                    }
+                ],
+            },
+            id="level-fractional-second",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-22T22:00:00.0",
+                        "endGMT": "2026-08-22T23:00:00.0",
+                        "activityLevel": 0,
+                    }
+                ],
+            },
+            id="level-outside-night",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T99:00:00.0",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": 0,
+                    }
+                ],
+            },
+            id="level-impossible-clock",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00.0",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": 1.5,
+                    }
+                ],
+            },
+            id="fractional-activity-level",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00.0",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": float("nan"),
+                    }
+                ],
+            },
+            id="non-finite-activity-level",
+        ),
+        pytest.param(
+            _fabricated_sleep_detail(napTimeSeconds=100),
+            id="nap-total-disagrees",
+        ),
+        pytest.param(
+            _fabricated_sleep_detail(
+                napTimeSeconds=1_800,
+                dailyNapDTOS=[
+                    {
+                        "napTimeSec": 1_800,
+                        "napStartTimestampGMT": "2026-08-25T09:00:00",
+                        "napEndTimestampGMT": "2026-08-25T09:30:00",
+                        "napStartTimeOffset": 120,
+                        "napEndTimeOffset": 120,
+                    }
+                ],
+            ),
+            id="nap-missing-date",
+        ),
+        pytest.param(
+            _fabricated_sleep_detail(
+                napTimeSeconds=1_800,
+                dailyNapDTOS=[
+                    {
+                        "calendarDate": DAY.isoformat(),
+                        "napTimeSec": 1_800,
+                        "napStartTimestampGMT": "2026-08-25T09:00:00",
+                        "napEndTimestampGMT": "2026-08-25T09:30:00",
+                        "napStartTimeOffset": 20 * 60,
+                        "napEndTimeOffset": 120,
+                    }
+                ],
+            ),
+            id="nap-offset-out-of-range",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {"startGMT": "bad", "endGMT": "2026-08-24T23:00:00.0", "activityLevel": 0}
+                ],
+            },
+            id="level-clock-too-short",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00\n",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": 0,
+                    }
+                ],
+            },
+            id="level-clock-control-character",
+        ),
+        pytest.param(
+            {
+                **_fabricated_sleep_detail(),
+                "sleepLevels": [
+                    {
+                        "startGMT": "2026-08-24T22:00:00.0",
+                        "endGMT": "2026-08-24T23:00:00.0",
+                        "activityLevel": 10**400,
+                    }
+                ],
+            },
+            id="activity-level-overflow",
+        ),
+        pytest.param(
+            _fabricated_sleep_detail(
+                napTimeSeconds=1_800,
+                dailyNapDTOS=[
+                    {
+                        "calendarDate": DAY.isoformat(),
+                        "napTimeSec": 1_800,
+                        "napStartTimestampGMT": "2026-08-25T09:00:00",
+                        "napEndTimestampGMT": "2026-08-25T09:30:00",
+                        "napStartTimeOffset": "120",
+                        "napEndTimeOffset": 120,
+                    }
+                ],
+            ),
+            id="nap-offset-not-integer",
         ),
     ],
 )

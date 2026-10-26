@@ -92,6 +92,35 @@ class SleepRangeDay:
     score: int | None
 
 
+class SleepStage(StrEnum):
+    """Reviewed sleep-stage names admitted from `sleepLevels` activity levels."""
+
+    DEEP = "deep"
+    LIGHT = "light"
+    REM = "rem"
+    AWAKE = "awake"
+
+
+@dataclass(frozen=True, slots=True)
+class SleepLevel:
+    """One contiguous main-night stage interval stored as UTC instants."""
+
+    stage: SleepStage
+    start_utc: str
+    end_utc: str
+
+
+@dataclass(frozen=True, slots=True)
+class SleepNap:
+    """One nap admitted from `dailyNapDTOS`, with UTC instants and local clocks."""
+
+    nap_seconds: int
+    start_utc: str
+    end_utc: str
+    start_local: str
+    end_local: str
+
+
 @dataclass(frozen=True, slots=True)
 class SleepDay:
     """Reviewed detailed Sleep scalars for one Garmin calendar date."""
@@ -105,6 +134,9 @@ class SleepDay:
     awake_seconds: int | None
     start_local: str | None = None
     end_local: str | None = None
+    nap_time_seconds: int | None = None
+    levels: tuple[SleepLevel, ...] | None = ()
+    naps: tuple[SleepNap, ...] | None = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +207,7 @@ class DailyWellness:
     vo2_max_cycling: float | None = None
     sleep_start_local: str | None = None
     sleep_end_local: str | None = None
+    nap_time_seconds: int | None = None
 
 
 WellnessWriteDay = (

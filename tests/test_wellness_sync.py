@@ -474,6 +474,41 @@ def test_manual_refresh_backfills_missing_sleep_clocks_without_dropping_rows(
     assert older.sleep_end_local is None
 
 
+def test_manual_refresh_backfills_missing_sleep_levels_inside_the_detail_cap(
+    tmp_path: Path,
+) -> None:
+    configured = _Configured(tmp_path)
+    configured.service.refresh()
+    with closing(sqlite3.connect(configured.paths.activity_database)) as connection:
+        connection.execute(
+            """
+            UPDATE wellness_daily
+            SET sleep_start_local = '2026-08-25T22:04:00',
+                sleep_end_local = '2026-08-26T06:30:00',
+                sleep_levels_known = 0
+            WHERE sleep_score IS NOT NULL
+            """
+        )
+        connection.commit()
+
+    configured.service.refresh(manual=True)
+
+    detail_dates = [
+        call[1] for call in configured.gateway.connections[-1].calls if call[0] == "sleep_detail"
+    ]
+    assert detail_dates == [TODAY - timedelta(days=offset) for offset in range(7)]
+    with closing(sqlite3.connect(configured.paths.activity_database)) as connection:
+        known = dict(
+            connection.execute(
+                "SELECT calendar_date, sleep_levels_known FROM wellness_daily"
+            ).fetchall()
+        )
+    assert known[TODAY.isoformat()] == 1
+    assert known[(TODAY - timedelta(days=6)).isoformat()] == 1
+    assert known[(TODAY - timedelta(days=7)).isoformat()] == 0
+    assert configured.repository.sleep_intervals(TODAY).levels == ()
+
+
 def test_historical_overlap_runs_once_each_local_date_and_full_no_more_than_weekly(
     tmp_path: Path,
 ) -> None:

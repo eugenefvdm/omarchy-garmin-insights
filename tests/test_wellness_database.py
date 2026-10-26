@@ -8,7 +8,7 @@ import pytest
 
 import omarchy_garmin.database as database_module
 from omarchy_garmin.auth import AuthStore
-from omarchy_garmin.database import SCHEMA_VERSION, ActivityRepository
+from omarchy_garmin.database import SCHEMA_VERSION, ActivityRepository, GarminDatabase
 from omarchy_garmin.paths import AppPaths
 from omarchy_garmin.storage import ensure_private_directory
 from omarchy_garmin.wellness import (
@@ -16,7 +16,10 @@ from omarchy_garmin.wellness import (
     HrvDay,
     RestingHeartRateDay,
     SleepDay,
+    SleepLevel,
+    SleepNap,
     SleepRangeDay,
+    SleepStage,
     StepsDay,
     TrainingReadinessDay,
     UserSummaryDay,
@@ -107,6 +110,8 @@ def test_schema_one_migration_preserves_activity_rows_and_adds_only_reviewed_wel
     assert "vo2_max_cycling" in columns
     assert "sleep_start_local" in columns
     assert "sleep_end_local" in columns
+    assert "nap_time_seconds" in columns
+    assert "sleep_levels_known" in columns
     assert "body_battery_values_array" not in columns
     assert "timestamp_local" not in columns
     assert "input_context" not in columns
@@ -163,6 +168,8 @@ def test_repeated_migration_is_idempotent_across_activity_and_wellness_repositor
         ("wellness_account_scope",),
         ("wellness_collection_state",),
         ("wellness_daily",),
+        ("wellness_sleep_levels",),
+        ("wellness_sleep_naps",),
         ("wellness_source_state",),
     ]
     assert account_rows == (1,)
@@ -684,11 +691,13 @@ def test_schema_two_migration_adds_vo2_max_and_preserves_retained_scalars(
                 (TODAY.isoformat(),),
             )
     assert version == SCHEMA_VERSION
-    assert columns[-4:] == [
+    assert columns[-6:] == [
         "vo2_max_running",
         "vo2_max_cycling",
         "sleep_start_local",
         "sleep_end_local",
+        "nap_time_seconds",
+        "sleep_levels_known",
     ]
     assert stored.steps == 4_200
     assert stored.vo2_max_running == 48.2
@@ -738,7 +747,12 @@ def test_schema_three_migration_adds_sleep_clocks_and_preserves_retained_scalars
                 (TODAY.isoformat(),),
             )
     assert version == SCHEMA_VERSION
-    assert columns[-2:] == ["sleep_start_local", "sleep_end_local"]
+    assert columns[-4:] == [
+        "sleep_start_local",
+        "sleep_end_local",
+        "nap_time_seconds",
+        "sleep_levels_known",
+    ]
     assert table_sql is not None
     assert "STRICT" in str(table_sql[0])
     assert stored.steps == 4_200
@@ -818,3 +832,189 @@ def test_malformed_stored_sleep_clock_is_rejected_on_read(
 
     with pytest.raises(WellnessDatabaseError):
         repository.wellness_between(TODAY, TODAY)
+
+
+def _interval_day(
+    *,
+    levels: tuple[SleepLevel, ...] | None,
+    naps: tuple[SleepNap, ...] | None = (),
+    nap_time_seconds: int | None = 1_800,
+    score: int | None = 80,
+) -> SleepDay:
+    return SleepDay(
+        TODAY,
+        score,
+        22_200,
+        3_600,
+        14_400,
+        3_600,
+        600,
+        "2026-08-25T22:00:00",
+        "2026-08-26T04:10:00",
+        nap_time_seconds,
+        levels,
+        naps,
+    )
+
+
+_FIRST_LEVELS = (
+    SleepLevel(SleepStage.DEEP, "2026-08-25T22:00:00Z", "2026-08-25T23:00:00Z"),
+    SleepLevel(SleepStage.LIGHT, "2026-08-25T23:00:00Z", "2026-08-26T03:00:00Z"),
+    SleepLevel(SleepStage.REM, "2026-08-26T03:00:00Z", "2026-08-26T04:00:00Z"),
+    SleepLevel(SleepStage.AWAKE, "2026-08-26T04:00:00Z", "2026-08-26T04:10:00Z"),
+)
+_FIRST_NAP = SleepNap(
+    1_800,
+    "2026-08-26T09:00:00Z",
+    "2026-08-26T09:30:00Z",
+    "2026-08-26T11:00:00",
+    "2026-08-26T11:30:00",
+)
+
+
+def test_sleep_detail_upsert_replaces_levels_and_naps_for_the_date(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _upsert_steps(repository, TODAY, 4_200)
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [_interval_day(levels=_FIRST_LEVELS, naps=(_FIRST_NAP,))],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+    replacement = (SleepLevel(SleepStage.LIGHT, "2026-08-25T22:00:00Z", "2026-08-26T04:10:00Z"),)
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [_interval_day(levels=replacement, naps=(), nap_time_seconds=0)],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+
+    stored = repository.wellness_between(TODAY, TODAY)[0]
+    intervals = repository.sleep_intervals(TODAY)
+    assert stored.steps == 4_200
+    assert stored.nap_time_seconds == 0
+    assert intervals.levels == replacement
+    assert intervals.naps == ()
+
+
+def test_rejected_sleep_levels_keep_the_previous_child_rows(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [_interval_day(levels=_FIRST_LEVELS, naps=(_FIRST_NAP,))],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [_interval_day(levels=None, naps=None, nap_time_seconds=None, score=70)],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+    with pytest.raises(ValueError):
+        repository.upsert_source(
+            WellnessSource.SLEEP,
+            [
+                _interval_day(
+                    levels=(SleepLevel(SleepStage.DEEP, "not-a-clock", "2026-08-26T04:10:00Z"),)
+                )
+            ],
+            as_of_date=TODAY,
+            refreshed_at=REFRESHED_AT,
+        )
+
+    stored = repository.wellness_between(TODAY, TODAY)[0]
+    intervals = repository.sleep_intervals(TODAY)
+    assert stored.sleep_score == 70
+    assert stored.nap_time_seconds == 1_800
+    assert intervals.levels == _FIRST_LEVELS
+    assert intervals.naps == (_FIRST_NAP,)
+
+
+def test_sleep_range_upsert_does_not_clear_nap_time(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [_interval_day(levels=_FIRST_LEVELS, naps=(_FIRST_NAP,))],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [SleepRangeDay(TODAY, 91)],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+
+    stored = repository.wellness_between(TODAY, TODAY)[0]
+    assert stored.sleep_score == 91
+    assert stored.nap_time_seconds == 1_800
+    assert repository.sleep_intervals(TODAY).naps == (_FIRST_NAP,)
+
+
+def test_deleting_the_account_scope_cascades_sleep_interval_rows(tmp_path: Path) -> None:
+    database = tmp_path / "private" / "activities.sqlite3"
+    repository = WellnessRepository(database, ACCOUNT_A)
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [_interval_day(levels=_FIRST_LEVELS, naps=(_FIRST_NAP,))],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+
+    with GarminDatabase(database).connection() as connection:
+        connection.execute("DELETE FROM wellness_account_scope")
+
+    with closing(sqlite3.connect(database)) as connection:
+        levels = connection.execute("SELECT count(*) FROM wellness_sleep_levels").fetchone()
+        naps = connection.execute("SELECT count(*) FROM wellness_sleep_naps").fetchone()
+        daily = connection.execute("SELECT count(*) FROM wellness_daily").fetchone()
+    assert levels == (0,)
+    assert naps == (0,)
+    assert daily == (0,)
+
+
+def test_retention_delete_removes_sleep_interval_rows(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    aged = TODAY - timedelta(days=29)
+    repository.upsert_source(
+        WellnessSource.SLEEP,
+        [
+            SleepDay(
+                aged,
+                80,
+                3_600,
+                3_600,
+                0,
+                0,
+                0,
+                levels=(
+                    SleepLevel(
+                        SleepStage.DEEP,
+                        "2026-07-27T22:00:00Z",
+                        "2026-07-27T23:00:00Z",
+                    ),
+                ),
+                naps=(),
+                nap_time_seconds=0,
+            )
+        ],
+        as_of_date=TODAY,
+        refreshed_at=REFRESHED_AT,
+    )
+
+    repository.upsert_source(
+        WellnessSource.STEPS,
+        [StepsDay(TODAY + timedelta(days=1), 10)],
+        as_of_date=TODAY + timedelta(days=1),
+        refreshed_at=REFRESHED_AT,
+    )
+
+    database = tmp_path / "private" / "activities.sqlite3"
+    with closing(sqlite3.connect(database)) as connection:
+        remaining = connection.execute(
+            "SELECT count(*) FROM wellness_sleep_levels WHERE calendar_date = ?",
+            (aged.isoformat(),),
+        ).fetchone()
+    assert remaining == (0,)

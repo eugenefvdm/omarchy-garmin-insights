@@ -358,7 +358,9 @@ def _bounded_days(days: Sequence[DailyWellness], as_of_date: date) -> tuple[Dail
 
 
 # Sleep clock strings are stored for a later chart and are not display scalars.
-_PRESENTATION_EXCLUDED_FIELDS = frozenset({"calendar_date", "sleep_start_local", "sleep_end_local"})
+_PRESENTATION_EXCLUDED_FIELDS = frozenset(
+    {"calendar_date", "sleep_start_local", "sleep_end_local", "nap_time_seconds"}
+)
 
 
 def _contributor_counts(days: Sequence[DailyWellness]) -> WellnessContributorCounts:

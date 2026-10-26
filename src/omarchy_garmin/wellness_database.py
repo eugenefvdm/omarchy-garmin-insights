@@ -18,7 +18,10 @@ from omarchy_garmin.wellness import (
     HrvDay,
     RestingHeartRateDay,
     SleepDay,
+    SleepLevel,
+    SleepNap,
     SleepRangeDay,
+    SleepStage,
     StepsDay,
     TrainingReadinessDay,
     UserSummaryDay,
@@ -45,6 +48,14 @@ class WellnessUpsertResult:
 
     stored_count: int
     deleted_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class StoredSleepIntervals:
+    """Level and nap rows stored for one calendar date."""
+
+    levels: tuple[SleepLevel, ...]
+    naps: tuple[SleepNap, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,9 +124,10 @@ INSERT INTO wellness_daily (
     vo2_max_running,
     vo2_max_cycling,
     sleep_start_local,
-    sleep_end_local
+    sleep_end_local,
+    nap_time_seconds
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 ON CONFLICT(account_fingerprint, calendar_date) DO UPDATE SET
     steps = coalesce(excluded.steps, wellness_daily.steps),
@@ -174,7 +186,34 @@ ON CONFLICT(account_fingerprint, calendar_date) DO UPDATE SET
     vo2_max_running = coalesce(excluded.vo2_max_running, wellness_daily.vo2_max_running),
     vo2_max_cycling = coalesce(excluded.vo2_max_cycling, wellness_daily.vo2_max_cycling),
     sleep_start_local = coalesce(excluded.sleep_start_local, wellness_daily.sleep_start_local),
-    sleep_end_local = coalesce(excluded.sleep_end_local, wellness_daily.sleep_end_local)
+    sleep_end_local = coalesce(excluded.sleep_end_local, wellness_daily.sleep_end_local),
+    nap_time_seconds = coalesce(excluded.nap_time_seconds, wellness_daily.nap_time_seconds)
+"""
+
+_DELETE_SLEEP_LEVELS = """
+DELETE FROM wellness_sleep_levels
+WHERE account_fingerprint = ? AND calendar_date = ?
+"""
+_DELETE_SLEEP_NAPS = """
+DELETE FROM wellness_sleep_naps
+WHERE account_fingerprint = ? AND calendar_date = ?
+"""
+_INSERT_SLEEP_LEVEL = """
+INSERT INTO wellness_sleep_levels (
+    account_fingerprint, calendar_date, seq, stage, start_utc, end_utc
+) VALUES (?, ?, ?, ?, ?, ?)
+"""
+_INSERT_SLEEP_NAP = """
+INSERT INTO wellness_sleep_naps (
+    account_fingerprint,
+    calendar_date,
+    seq,
+    nap_seconds,
+    start_utc,
+    end_utc,
+    start_local,
+    end_local
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -224,6 +263,81 @@ def _optional_bounded_real(value: object, *, minimum: float, maximum: float) -> 
     if not math.isfinite(result) or not minimum <= result <= maximum:
         raise ValueError("wellness number is invalid")
     return result
+
+
+def _required_utc_clock(value: object) -> str:
+    if not isinstance(value, str) or not 20 <= len(value) <= 40 or not value.endswith("Z"):
+        raise ValueError("sleep utc timestamp is invalid")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ValueError("sleep utc timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1])
+    except ValueError as error:
+        raise ValueError("sleep utc timestamp is invalid") from error
+    if parsed.tzinfo is not None or f"{parsed.isoformat(timespec='seconds')}Z" != value:
+        raise ValueError("sleep utc timestamp is invalid")
+    return value
+
+
+def _validate_level_clocks(levels: tuple[SleepLevel, ...]) -> None:
+    if len(levels) > 200:
+        raise ValueError("sleep levels are invalid")
+    previous_end: str | None = None
+    for level in levels:
+        if not isinstance(level, SleepLevel) or not isinstance(level.stage, SleepStage):
+            raise ValueError("sleep levels are invalid")
+        start = _required_utc_clock(level.start_utc)
+        end = _required_utc_clock(level.end_utc)
+        if start >= end or (previous_end is not None and start != previous_end):
+            raise ValueError("sleep levels are invalid")
+        previous_end = end
+
+
+def _validate_naps(naps: tuple[SleepNap, ...]) -> None:
+    if len(naps) > 8:
+        raise ValueError("sleep naps are invalid")
+    for nap in naps:
+        if not isinstance(nap, SleepNap):
+            raise ValueError("sleep naps are invalid")
+        _optional_integer(nap.nap_seconds, minimum=0, maximum=86_400)
+        start = _required_utc_clock(nap.start_utc)
+        end = _required_utc_clock(nap.end_utc)
+        if start >= end:
+            raise ValueError("sleep naps are invalid")
+        _optional_local_clock(nap.start_local)
+        _optional_local_clock(nap.end_local)
+
+
+def _validate_sleep_children(day: SleepDay) -> None:
+    if day.levels is not None:
+        _validate_level_clocks(day.levels)
+    if day.naps is not None:
+        _validate_naps(day.naps)
+
+
+def _level_from_row(row: Sequence[object]) -> SleepLevel:
+    if len(row) != 4 or type(row[0]) is not int or not isinstance(row[1], str):
+        raise ValueError("stored sleep level has an unexpected shape")
+    if not 0 <= row[0] <= 199:
+        raise ValueError("stored sleep level has an unexpected shape")
+    return SleepLevel(SleepStage(row[1]), _required_utc_clock(row[2]), _required_utc_clock(row[3]))
+
+
+def _nap_from_row(row: Sequence[object]) -> SleepNap:
+    if len(row) != 6 or type(row[0]) is not int or not 0 <= row[0] <= 7:
+        raise ValueError("stored sleep nap has an unexpected shape")
+    nap_seconds = _optional_integer(row[1], minimum=0, maximum=86_400)
+    start_local = _optional_local_clock(row[4])
+    end_local = _optional_local_clock(row[5])
+    if nap_seconds is None or start_local is None or end_local is None:
+        raise ValueError("stored sleep nap has an unexpected shape")
+    return SleepNap(
+        nap_seconds,
+        _required_utc_clock(row[2]),
+        _required_utc_clock(row[3]),
+        start_local,
+        end_local,
+    )
 
 
 def _optional_local_clock(value: object) -> str | None:
@@ -313,6 +427,7 @@ def _daily_for_source(source: WellnessSource, day: WellnessWriteDay) -> DailyWel
             sleep_awake_seconds=sleep_parts[3],
             sleep_start_local=_optional_local_clock(day.start_local),
             sleep_end_local=_optional_local_clock(day.end_local),
+            nap_time_seconds=_optional_integer(day.nap_time_seconds, minimum=0, maximum=86_400),
         )
     if source is WellnessSource.HRV and isinstance(day, HrvDay):
         balanced_low = _optional_real(day.balanced_low_ms)
@@ -412,6 +527,7 @@ def _validated_daily(day: DailyWellness) -> DailyWellness:
         vo2_max_cycling=_optional_vo2(day.vo2_max_cycling),
         sleep_start_local=_optional_local_clock(day.sleep_start_local),
         sleep_end_local=_optional_local_clock(day.sleep_end_local),
+        nap_time_seconds=_optional_integer(day.nap_time_seconds, minimum=0, maximum=86_400),
     )
 
 
@@ -447,6 +563,9 @@ class WellnessRepository:
         retention_start = as_of_date - timedelta(days=WELLNESS_RETENTION_DAYS - 1)
         if any(not retention_start <= day.calendar_date <= as_of_date for day in normalized):
             raise ValueError("wellness date is outside the retention period")
+        for day in days:
+            if isinstance(day, SleepDay):
+                _validate_sleep_children(day)
 
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -456,6 +575,7 @@ class WellnessRepository:
                     _UPSERT_WELLNESS,
                     (self._write_row(day) for day in normalized),
                 )
+                self._replace_sleep_children(connection, days)
                 deleted = connection.execute(
                     """
                     DELETE FROM wellness_daily
@@ -520,7 +640,8 @@ class WellnessRepository:
                     vo2_max_running,
                     vo2_max_cycling,
                     sleep_start_local,
-                    sleep_end_local
+                    sleep_end_local,
+                    nap_time_seconds
                 FROM wellness_daily
                 WHERE account_fingerprint = ? AND calendar_date BETWEEN ? AND ?
                 ORDER BY calendar_date
@@ -535,6 +656,76 @@ class WellnessRepository:
             return [self._read_row(row) for row in rows]
         except (TypeError, ValueError) as error:
             raise WellnessDatabaseError("stored wellness data is invalid") from error
+
+    def sleep_intervals(self, calendar_date: date) -> StoredSleepIntervals:
+        """Return stored stage intervals and naps for one retained date."""
+        if type(calendar_date) is not date:
+            raise ValueError("wellness date is invalid")
+        with self._read_connection() as connection:
+            if connection is None or not self._account_matches(connection):
+                return StoredSleepIntervals((), ())
+            level_rows = connection.execute(
+                """
+                SELECT seq, stage, start_utc, end_utc
+                FROM wellness_sleep_levels
+                WHERE account_fingerprint = ? AND calendar_date = ?
+                ORDER BY seq
+                """,
+                (self._account_fingerprint, calendar_date.isoformat()),
+            ).fetchall()
+            nap_rows = connection.execute(
+                """
+                SELECT seq, nap_seconds, start_utc, end_utc, start_local, end_local
+                FROM wellness_sleep_naps
+                WHERE account_fingerprint = ? AND calendar_date = ?
+                ORDER BY seq
+                """,
+                (self._account_fingerprint, calendar_date.isoformat()),
+            ).fetchall()
+        try:
+            return StoredSleepIntervals(
+                tuple(_level_from_row(row) for row in level_rows),
+                tuple(_nap_from_row(row) for row in nap_rows),
+            )
+        except (TypeError, ValueError) as error:
+            raise WellnessDatabaseError("stored sleep intervals are invalid") from error
+
+    def dates_missing_sleep_levels(self, start_date: date, end_date: date) -> tuple[date, ...]:
+        """Return newest-first dates that have sleep scalars but no accepted levels."""
+        if type(start_date) is not date or type(end_date) is not date or start_date > end_date:
+            raise ValueError("wellness date period is invalid")
+        with self._read_connection() as connection:
+            if connection is None or not self._account_matches(connection):
+                return ()
+            rows = connection.execute(
+                """
+                SELECT calendar_date
+                FROM wellness_daily
+                WHERE account_fingerprint = ?
+                  AND calendar_date BETWEEN ? AND ?
+                  AND sleep_levels_known = 0
+                  AND (
+                      sleep_score IS NOT NULL
+                      OR sleep_total_seconds IS NOT NULL
+                      OR sleep_deep_seconds IS NOT NULL
+                      OR sleep_light_seconds IS NOT NULL
+                      OR sleep_rem_seconds IS NOT NULL
+                      OR sleep_awake_seconds IS NOT NULL
+                      OR sleep_start_local IS NOT NULL
+                      OR sleep_end_local IS NOT NULL
+                  )
+                ORDER BY calendar_date DESC
+                """,
+                (
+                    self._account_fingerprint,
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                ),
+            ).fetchall()
+        try:
+            return tuple(date.fromisoformat(str(row[0])) for row in rows)
+        except (TypeError, ValueError) as error:
+            raise WellnessDatabaseError("stored sleep interval state is invalid") from error
 
     def source_freshness(self) -> list[WellnessSourceFreshness]:
         """Return validated private freshness timestamps for this account."""
@@ -734,9 +925,67 @@ class WellnessRepository:
             *(getattr(day, field.name) for field in fields(day) if field.name != "calendar_date"),
         )
 
+    def _replace_sleep_children(
+        self,
+        connection: sqlite3.Connection,
+        days: Sequence[WellnessWriteDay],
+    ) -> None:
+        for day in days:
+            if not isinstance(day, SleepDay):
+                continue
+            calendar_date = day.calendar_date.isoformat()
+            if day.levels is not None:
+                connection.execute(
+                    _DELETE_SLEEP_LEVELS,
+                    (self._account_fingerprint, calendar_date),
+                )
+                connection.executemany(
+                    _INSERT_SLEEP_LEVEL,
+                    (
+                        (
+                            self._account_fingerprint,
+                            calendar_date,
+                            seq,
+                            level.stage.value,
+                            level.start_utc,
+                            level.end_utc,
+                        )
+                        for seq, level in enumerate(day.levels)
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE wellness_daily
+                    SET sleep_levels_known = 1
+                    WHERE account_fingerprint = ? AND calendar_date = ?
+                    """,
+                    (self._account_fingerprint, calendar_date),
+                )
+            if day.naps is not None:
+                connection.execute(
+                    _DELETE_SLEEP_NAPS,
+                    (self._account_fingerprint, calendar_date),
+                )
+                connection.executemany(
+                    _INSERT_SLEEP_NAP,
+                    (
+                        (
+                            self._account_fingerprint,
+                            calendar_date,
+                            seq,
+                            nap.nap_seconds,
+                            nap.start_utc,
+                            nap.end_utc,
+                            nap.start_local,
+                            nap.end_local,
+                        )
+                        for seq, nap in enumerate(day.naps)
+                    ),
+                )
+
     @staticmethod
     def _read_row(row: Sequence[object]) -> DailyWellness:
-        if len(row) != 26:
+        if len(row) != 27:
             raise ValueError("stored wellness row has an unexpected shape")
         calendar_date = date.fromisoformat(str(row[0]))
         return _validated_daily(DailyWellness(calendar_date, *row[1:]))  # type: ignore[arg-type]

@@ -22,7 +22,7 @@ from omarchy_garmin.storage import (
     private_file_exists,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class GarminDatabaseError(RuntimeError):
@@ -197,7 +197,55 @@ ALTER TABLE wellness_daily ADD COLUMN sleep_start_local TEXT
 ALTER TABLE wellness_daily ADD COLUMN sleep_end_local TEXT
     CHECK (sleep_end_local IS NULL OR length(sleep_end_local) BETWEEN 19 AND 40);
 """
-_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2, 3: _MIGRATION_3, 4: _MIGRATION_4}
+_MIGRATION_5 = """
+ALTER TABLE wellness_daily ADD COLUMN nap_time_seconds INTEGER
+    CHECK (nap_time_seconds IS NULL OR nap_time_seconds BETWEEN 0 AND 86400);
+ALTER TABLE wellness_daily ADD COLUMN sleep_levels_known INTEGER NOT NULL DEFAULT 0
+    CHECK (sleep_levels_known IN (0, 1));
+CREATE TABLE wellness_sleep_levels (
+    account_fingerprint TEXT NOT NULL,
+    calendar_date TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    start_utc TEXT NOT NULL,
+    end_utc TEXT NOT NULL,
+    PRIMARY KEY (account_fingerprint, calendar_date, seq),
+    FOREIGN KEY (account_fingerprint, calendar_date)
+        REFERENCES wellness_daily(account_fingerprint, calendar_date) ON DELETE CASCADE,
+    CHECK (seq BETWEEN 0 AND 199),
+    CHECK (stage IN ('deep', 'light', 'rem', 'awake')),
+    CHECK (length(start_utc) BETWEEN 20 AND 40),
+    CHECK (length(end_utc) BETWEEN 20 AND 40),
+    CHECK (start_utc < end_utc)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE wellness_sleep_naps (
+    account_fingerprint TEXT NOT NULL,
+    calendar_date TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    nap_seconds INTEGER NOT NULL,
+    start_utc TEXT NOT NULL,
+    end_utc TEXT NOT NULL,
+    start_local TEXT NOT NULL,
+    end_local TEXT NOT NULL,
+    PRIMARY KEY (account_fingerprint, calendar_date, seq),
+    FOREIGN KEY (account_fingerprint, calendar_date)
+        REFERENCES wellness_daily(account_fingerprint, calendar_date) ON DELETE CASCADE,
+    CHECK (seq BETWEEN 0 AND 7),
+    CHECK (nap_seconds BETWEEN 0 AND 86400),
+    CHECK (length(start_utc) BETWEEN 20 AND 40),
+    CHECK (length(end_utc) BETWEEN 20 AND 40),
+    CHECK (length(start_local) BETWEEN 19 AND 40),
+    CHECK (length(end_local) BETWEEN 19 AND 40),
+    CHECK (start_utc < end_utc)
+) STRICT, WITHOUT ROWID;
+"""
+_MIGRATIONS = {
+    1: _MIGRATION_1,
+    2: _MIGRATION_2,
+    3: _MIGRATION_3,
+    4: _MIGRATION_4,
+    5: _MIGRATION_5,
+}
 
 _SCHEMA_1_COLUMNS = {
     "activities": (
@@ -268,11 +316,38 @@ _SCHEMA_4_COLUMNS = {
         "sleep_end_local",
     ),
 }
+_SCHEMA_5_COLUMNS = {
+    **_SCHEMA_4_COLUMNS,
+    "wellness_daily": (
+        *_SCHEMA_4_COLUMNS["wellness_daily"],
+        "nap_time_seconds",
+        "sleep_levels_known",
+    ),
+    "wellness_sleep_levels": (
+        "account_fingerprint",
+        "calendar_date",
+        "seq",
+        "stage",
+        "start_utc",
+        "end_utc",
+    ),
+    "wellness_sleep_naps": (
+        "account_fingerprint",
+        "calendar_date",
+        "seq",
+        "nap_seconds",
+        "start_utc",
+        "end_utc",
+        "start_local",
+        "end_local",
+    ),
+}
 _SCHEMA_COLUMNS = {
     1: _SCHEMA_1_COLUMNS,
     2: _SCHEMA_2_COLUMNS,
     3: _SCHEMA_3_COLUMNS,
     4: _SCHEMA_4_COLUMNS,
+    5: _SCHEMA_5_COLUMNS,
 }
 
 

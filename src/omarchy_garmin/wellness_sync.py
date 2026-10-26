@@ -151,6 +151,10 @@ class WellnessRepositoryOperations(Protocol):
         """Return retained daily values used to select bounded backfill."""
         ...
 
+    def dates_missing_sleep_levels(self, start_date: date, end_date: date) -> tuple[date, ...]:
+        """Return newest-first dates whose detailed levels have not been accepted."""
+        ...
+
     def source_freshness(self) -> list[WellnessSourceFreshness]:
         """Return successful source freshness used by the display contract."""
         ...
@@ -474,6 +478,30 @@ def _bounded_targets(
     return tuple(targets), backfill_selected
 
 
+def _extend_sleep_level_dates(
+    sleep_dates: tuple[date, ...],
+    *,
+    missing_dates: Sequence[date],
+    today: date,
+    enabled: bool,
+    base_calls: int,
+) -> tuple[date, ...]:
+    """Add retained dates that already have sleep values but no accepted stage levels."""
+    if not enabled:
+        return sleep_dates
+    selected = list(sleep_dates)
+    oldest = today - timedelta(days=WELLNESS_RETENTION_DAYS - 1)
+    for candidate in missing_dates:
+        if len(selected) >= MAX_SLEEP_DETAIL_CALLS:
+            break
+        if candidate < oldest or candidate > today or candidate in selected:
+            continue
+        if base_calls + len(selected) + 1 > MAX_WELLNESS_DATA_CALLS:
+            break
+        selected.append(candidate)
+    return tuple(selected)
+
+
 def build_refresh_plan(
     *,
     today: date,
@@ -481,6 +509,7 @@ def build_refresh_plan(
     manual: bool,
     cadence: WellnessCadenceState,
     stored_days: Sequence[DailyWellness],
+    missing_sleep_level_dates: Sequence[date] = (),
 ) -> WellnessRefreshPlan:
     """Build a deterministic plan from private cadence and retained local values."""
     if type(today) is not date or now.tzinfo is None or now.utcoffset() is None:
@@ -539,12 +568,21 @@ def build_refresh_plan(
         training_readiness_dates=readiness_dates,
         vo2_max_start=vo2_start,
     ).data_call_count(today)
+    detail_base_calls = occupied - len(sleep_dates)
+    detail_enabled = current_sleep or backfill_due
     sleep_dates = _extend_sleep_clock_dates(
         sleep_dates,
         today=today,
         stored=stored,
-        enabled=current_sleep or backfill_due,
-        base_calls=occupied - len(sleep_dates),
+        enabled=detail_enabled,
+        base_calls=detail_base_calls,
+    )
+    sleep_dates = _extend_sleep_level_dates(
+        sleep_dates,
+        missing_dates=missing_sleep_level_dates,
+        today=today,
+        enabled=detail_enabled,
+        base_calls=detail_base_calls,
     )
     plan = WellnessRefreshPlan(
         historical_start=historical_start,
@@ -659,6 +697,9 @@ class WellnessSyncService:
                 manual=manual,
                 cadence=repository.cadence_state(),
                 stored_days=repository.wellness_between(retention_start, today),
+                missing_sleep_level_dates=repository.dates_missing_sleep_levels(
+                    retention_start, today
+                ),
             )
         except WellnessAccountMismatchError as error:
             raise WellnessAccountScopeError("wellness data belongs to another account") from error

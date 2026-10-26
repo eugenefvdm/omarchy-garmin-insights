@@ -14,7 +14,10 @@ from omarchy_garmin.wellness import (
     InvalidWellnessDataError,
     RestingHeartRateDay,
     SleepDay,
+    SleepLevel,
+    SleepNap,
     SleepRangeDay,
+    SleepStage,
     StepsDay,
     TrainingReadinessDay,
     UserSummaryDay,
@@ -39,6 +42,17 @@ _MAX_VO2_MAX = 100.0
 _MAX_REMOTE_TEXT = 64
 _AFTER_WAKEUP_CONTEXT = "AFTER_WAKEUP_RESET"
 _MAX_TIMESTAMP_LENGTH = 40
+_MAX_SLEEP_LEVELS = 200
+_MAX_SLEEP_NAPS = 8
+_STAGE_DURATION_SLACK_SECONDS = 1
+_NAP_DURATION_SLACK_SECONDS = 2
+_MAX_UTC_OFFSET_MINUTES = 14 * 60
+_SLEEP_STAGE_BY_LEVEL = {
+    0: SleepStage.DEEP,
+    1: SleepStage.LIGHT,
+    2: SleepStage.REM,
+    3: SleepStage.AWAKE,
+}
 
 
 def _invalid(source: WellnessSource) -> InvalidWellnessDataError:
@@ -325,7 +339,12 @@ def _local_epoch_clock(value: object, source: WellnessSource, calendar_date: dat
 
 
 def parse_sleep_detail(payload: object, requested_date: date) -> SleepDay | None:
-    """Validate one detailed Sleep response and discard samples and unreviewed fields."""
+    """Validate one detailed Sleep response and discard samples and unreviewed fields.
+
+    `levels` is `None` only when admitted intervals disagree with the stage scalars.
+    That result keeps previously stored level rows. An omitted or empty `sleepLevels`
+    list is an empty tuple and replaces stored levels for the date.
+    """
     source = WellnessSource.SLEEP
     if payload is None:
         return None
@@ -359,6 +378,11 @@ def parse_sleep_detail(payload: object, requested_date: date) -> SleepDay | None
     end_local = _local_epoch_clock(row.get("sleepEndTimestampLocal"), source, calendar_date)
     if start_local is not None and end_local is not None and start_local > end_local:
         raise _invalid(source)
+    nap_time_seconds = _optional_integer(
+        row.get("napTimeSeconds"), source, minimum=0, maximum=_MAX_SLEEP_SECONDS
+    )
+    levels = _sleep_levels(response, source, calendar_date, deep, light, rem, awake)
+    naps = _sleep_naps(row, source, calendar_date, nap_time_seconds)
     return SleepDay(
         calendar_date,
         score,
@@ -369,7 +393,175 @@ def parse_sleep_detail(payload: object, requested_date: date) -> SleepDay | None
         awake,
         start_local,
         end_local,
+        nap_time_seconds,
+        levels,
+        naps,
     )
+
+
+def _naive_gmt(value: object, source: WellnessSource, calendar_date: date) -> datetime:
+    """Accept a naive Garmin GMT timestamp inside the night's calendar-date envelope."""
+    if not isinstance(value, str) or not 19 <= len(value) <= _MAX_TIMESTAMP_LENGTH:
+        raise _invalid(source)
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise _invalid(source)
+    if value.endswith(("Z", "z")) or "+" in value or value.count("-") > 2:
+        raise _invalid(source)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _invalid(source) from None
+    if parsed.tzinfo is not None or parsed.microsecond != 0:
+        raise _invalid(source)
+    earliest = datetime.combine(calendar_date - timedelta(days=1), time.min)
+    latest = datetime.combine(calendar_date + timedelta(days=2), time.min)
+    if parsed < earliest or parsed >= latest:
+        raise _invalid(source)
+    return parsed
+
+
+def _utc_text(instant: datetime) -> str:
+    return instant.isoformat(timespec="seconds") + "Z"
+
+
+def _sleep_stage(value: object, source: WellnessSource) -> SleepStage:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise _invalid(source)
+    try:
+        numeric = float(value)
+    except OverflowError:
+        raise _invalid(source) from None
+    if not math.isfinite(numeric):
+        raise _invalid(source)
+    if isinstance(value, float) and not value.is_integer():
+        raise _invalid(source)
+    stage = _SLEEP_STAGE_BY_LEVEL.get(int(value))
+    if stage is None:
+        raise _invalid(source)
+    return stage
+
+
+def _level_seconds(level: SleepLevel) -> int:
+    start = datetime.fromisoformat(level.start_utc[:-1])
+    end = datetime.fromisoformat(level.end_utc[:-1])
+    return int((end - start).total_seconds())
+
+
+def _stage_durations_match(
+    levels: tuple[SleepLevel, ...],
+    deep: int | None,
+    light: int | None,
+    rem: int | None,
+    awake: int | None,
+) -> bool:
+    totals = dict.fromkeys(SleepStage, 0)
+    for level in levels:
+        totals[level.stage] += _level_seconds(level)
+    expected = {
+        SleepStage.DEEP: deep,
+        SleepStage.LIGHT: light,
+        SleepStage.REM: rem,
+        SleepStage.AWAKE: awake,
+    }
+    return all(
+        scalar is None or abs(totals[stage] - scalar) <= _STAGE_DURATION_SLACK_SECONDS
+        for stage, scalar in expected.items()
+    )
+
+
+def _sleep_levels(
+    response: Mapping[object, object],
+    source: WellnessSource,
+    calendar_date: date,
+    deep: int | None,
+    light: int | None,
+    rem: int | None,
+    awake: int | None,
+) -> tuple[SleepLevel, ...] | None:
+    raw_levels = response.get("sleepLevels")
+    if raw_levels is None:
+        return ()
+    rows = _bounded_list(raw_levels, source, _MAX_SLEEP_LEVELS)
+    levels: list[SleepLevel] = []
+    previous_end: datetime | None = None
+    for raw_row in rows:
+        row = _mapping(raw_row, source)
+        start = _naive_gmt(row.get("startGMT"), source, calendar_date)
+        end = _naive_gmt(row.get("endGMT"), source, calendar_date)
+        if start >= end or (previous_end is not None and start != previous_end):
+            raise _invalid(source)
+        previous_end = end
+        levels.append(
+            SleepLevel(
+                _sleep_stage(row.get("activityLevel"), source),
+                _utc_text(start),
+                _utc_text(end),
+            )
+        )
+    parsed = tuple(levels)
+    if not _stage_durations_match(parsed, deep, light, rem, awake):
+        return None
+    return parsed
+
+
+def _utc_offset_minutes(value: object, source: WellnessSource) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _invalid(source)
+    if abs(value) > _MAX_UTC_OFFSET_MINUTES:
+        raise _invalid(source)
+    return value
+
+
+def _sleep_nap(
+    raw_nap: object,
+    source: WellnessSource,
+    calendar_date: date,
+) -> SleepNap:
+    row = _mapping(raw_nap, source)
+    nap_date = _calendar_date(row.get("calendarDate"), source, calendar_date, calendar_date)
+    seconds = _optional_integer(
+        row.get("napTimeSec"), source, minimum=0, maximum=_MAX_SLEEP_SECONDS
+    )
+    if nap_date is None or seconds is None:
+        raise _invalid(source)
+    start = _naive_gmt(row.get("napStartTimestampGMT"), source, calendar_date)
+    end = _naive_gmt(row.get("napEndTimestampGMT"), source, calendar_date)
+    if start >= end:
+        raise _invalid(source)
+    if abs(int((end - start).total_seconds()) - seconds) > _NAP_DURATION_SLACK_SECONDS:
+        raise _invalid(source)
+    start_offset = _utc_offset_minutes(row.get("napStartTimeOffset"), source)
+    end_offset = _utc_offset_minutes(row.get("napEndTimeOffset"), source)
+    return SleepNap(
+        seconds,
+        _utc_text(start),
+        _utc_text(end),
+        (start + timedelta(minutes=start_offset)).isoformat(timespec="seconds"),
+        (end + timedelta(minutes=end_offset)).isoformat(timespec="seconds"),
+    )
+
+
+def _sleep_naps(
+    row: Mapping[object, object],
+    source: WellnessSource,
+    calendar_date: date,
+    nap_time_seconds: int | None,
+) -> tuple[SleepNap, ...]:
+    raw_naps = row.get("dailyNapDTOS")
+    if raw_naps is None:
+        naps: tuple[SleepNap, ...] = ()
+    else:
+        naps = tuple(
+            _sleep_nap(raw_nap, source, calendar_date)
+            for raw_nap in _bounded_list(raw_naps, source, _MAX_SLEEP_NAPS)
+        )
+    nap_total = sum(nap.nap_seconds for nap in naps)
+    if (
+        nap_time_seconds is not None
+        and abs(nap_time_seconds - nap_total) > _NAP_DURATION_SLACK_SECONDS
+    ):
+        raise _invalid(source)
+    return naps
 
 
 def _hrv_day(
